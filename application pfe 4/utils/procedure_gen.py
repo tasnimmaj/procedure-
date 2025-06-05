@@ -20,6 +20,7 @@ MAX_NOTE_LENGTH = 500       # Augmenter la taille des notes de référence
 MAX_EXAMPLES = 2            # Limite le nombre d'exemples à utiliser
 MIN_PROCEDURE_ROWS = 4      # Nombre minimum de lignes pour la procédure générée
 MAX_PROCEDURE_ROWS = 65    # Nombre maximum de lignes pour la procédure générée
+
 # --- Modèles disponibles ---
 MODELS = {
     "mistral-saba-24b": {
@@ -170,7 +171,7 @@ def find_similar_notes(vectorstore, query, k=MAX_EXAMPLES):
         for doc, score in results:
             note_id = doc.metadata.get('numero', '')
             note_title = doc.metadata.get('nom', 'Sans titre')
-              # Amélioration du calcul de similarité
+            # Amélioration du calcul de similarité
             similarity = 1.0 / (1.0 + score)  # Utiliser une fonction inverse pour la similarité
             
             # Ajuster le score en fonction de la longueur du contenu
@@ -192,6 +193,30 @@ def find_similar_notes(vectorstore, query, k=MAX_EXAMPLES):
     except Exception as e:
         print(f"Erreur lors de la recherche de notes similaires: {e}")
         return []
+
+# --- NOUVELLE FONCTION: Extraction des concepts clés ---
+def extract_key_concepts_from_procedures(procedures):
+    """Extrait les concepts clés des procédures sans donner les détails exacts"""
+    if not procedures:
+        return "Aucun concept disponible"
+    
+    key_concepts = []
+    activities_seen = set()
+    
+    for proc in procedures:
+        if isinstance(proc, dict) and 'etapes' in proc:
+            for etape in proc.get('etapes', []):
+                if isinstance(etape, dict):
+                    activite = etape.get('Activités', '').strip()
+                    if activite and activite not in activities_seen and len(activite) > 5:
+                        # Extraire seulement le concept principal, pas les détails
+                        concept = activite.split(':')[0].split('-')[0].strip()
+                        if len(concept) > 3:
+                            key_concepts.append(concept)
+                            activities_seen.add(activite)
+    
+    return ", ".join(key_concepts[:8])  # Limiter à 8 concepts maximum
+
 # --- Extraction de la procédure depuis les dossiers ---
 def extract_procedure_from_dossier_format(procedures):
     """Extrait les étapes de procédure au format attendu par le modèle"""
@@ -253,6 +278,188 @@ def init_llm(model_id="mistral-saba-24b", api_key=None):
         print(f"Erreur lors de l'initialisation du modèle LLM: {e}")
         return None
 
+# --- NOUVELLE FONCTION: Génération sans RAG ---
+def generate_procedure_without_rag(llm, query, min_steps, max_steps):
+    """Génère une procédure sans exemples RAG"""
+    print("Génération sans RAG (analyse pure de la note circulaire)")
+    
+    template = """# SYSTEM
+Vous êtes un expert en conformité bancaire islamique spécialisé dans l'analyse de notes circulaires.
+
+# MISSION
+Analysez en profondeur la note circulaire et créez EXACTEMENT {min_rows} étapes procédurales spécifiques.
+
+# MÉTHODE D'ANALYSE OBLIGATOIRE
+1. Identifiez l'OBJECTIF principal de la note
+2. Listez toutes les EXIGENCES mentionnées
+3. Identifiez les CONTRÔLES nécessaires
+4. Déterminez les ACTEURS impliqués
+5. Listez les DOCUMENTS requis
+
+# SORTIE FORMAT STRICT
+| N° | Activités | Description | Acteurs | Documents | Applications |
+[EXACTEMENT {min_rows} lignes basées sur l'analyse de la note]
+
+# CONTRAINTES SPÉCIFIQUES
+- Chaque description doit contenir 30-70 mots obligatoirement
+- Remplacez "crédit" par "Mourabaha" et "leasing" par "Leasing (Ijara)"
+- Chaque étape doit traiter un aspect concret de la note circulaire
+- Soyez précis et spécifique, évitez les généralités
+
+# NOTE CIRCULAIRE À ANALYSER
+{query}
+
+# INSTRUCTIONS
+Créez des étapes qui reflètent fidèlement le contenu et les exigences de cette note circulaire spécifique.
+Format: |N°|Activité|Description 30-70 mots|Acteurs|Documents|Applications|
+"""
+
+    prompt = PromptTemplate(
+        input_variables=['query', 'min_rows'],
+        template=template
+    )
+    
+    chain = LLMChain(llm=llm, prompt=prompt)
+    
+    try:
+        return chain.run({
+            'query': query,
+            'min_rows': min_steps
+        })
+    except Exception as e:
+        print(f"Erreur lors de génération sans RAG: {e}")
+        return simulate_procedure_generation(query, "mistral-saba-24b")
+
+# --- FONCTION MODIFIÉE: Génération principale de la procédure ---
+def generate_procedure(llm, query, similar_notes=None, notes_map=None, procedures_map=None, num_steps=None):
+    """Génère la procédure avec le LLM en utilisant des concepts inspirants plutôt que des exemples copiables"""
+    
+    # Forcer exactement le nombre d'étapes spécifié ou utiliser la valeur par défaut
+    if num_steps is not None:
+        print(f"Nombre d'étapes demandé par l'utilisateur: {num_steps}")
+        min_steps = num_steps
+        max_steps = num_steps
+        print(f"Génération avec exactement {num_steps} étapes")
+    else:
+        min_steps = MIN_PROCEDURE_ROWS
+        max_steps = MAX_PROCEDURE_ROWS
+        print("Utilisation du nombre d'étapes par défaut")
+    
+    # Tronquer la requête si elle est trop longue
+    query_truncated = query[:1200] if len(query) > 1200 else query
+    
+    # Debug information
+    print(f"Génération de procédure pour la requête: {query_truncated[:50]}...")
+    print(f"Utilisation du RAG: {'Oui' if similar_notes and len(similar_notes) > 0 else 'Non'}")
+    
+    # Chemin RAG avec notes similaires - APPROCHE CONCEPTUELLE
+    if similar_notes and len(similar_notes) > 0:
+        print(f"Utilisation de {len(similar_notes)} exemples similaires pour inspiration conceptuelle")
+        
+        # Limiter le nombre d'exemples pour économiser des tokens
+        similar_notes = similar_notes[:MAX_EXAMPLES]
+        
+        # NOUVELLE APPROCHE: Extraire seulement les concepts et patterns
+        conceptual_context = ""
+        domain_keywords = []
+        activity_patterns = []
+        
+        for i, note in enumerate(similar_notes, 1):
+            note_id = note['id']
+            procs = procedures_map.get(note_id, []) if procedures_map else []
+            
+            if procs:
+                # Extraire les mots-clés du domaine depuis la note similaire
+                note_text = notes_map.get(note_id, '')[:200] if notes_map else note['content'][:200]
+                
+                # Identifier le domaine (secteur d'activité)
+                if any(word in note_text.lower() for word in ['crédit', 'financement', 'prêt', 'mourabaha']):
+                    domain_keywords.append("financement")
+                if any(word in note_text.lower() for word in ['pme', 'entreprise', 'société']):
+                    domain_keywords.append("entreprises")
+                if any(word in note_text.lower() for word in ['conformité', 'réglementation', 'circulaire']):
+                    domain_keywords.append("conformité")
+                
+                # Extraire les patterns d'activités (concepts généraux)
+                key_concepts = extract_key_concepts_from_procedures(procs)
+                if key_concepts != "Aucun concept disponible":
+                    activity_patterns.append(key_concepts)
+        
+        # Construire un contexte conceptuel léger
+        if domain_keywords or activity_patterns:
+            unique_domains = list(set(domain_keywords))
+            conceptual_context = f"""
+CONTEXTE INSPIRANT (ne pas copier, s'en inspirer) :
+- Domaines similaires identifiés : {', '.join(unique_domains)}
+- Types d'activités courantes dans ce contexte : {'; '.join(activity_patterns[:2])}
+- Approche recommandée : Adapter ces concepts au contenu spécifique de votre note circulaire
+"""
+        
+        # Template avec contexte conceptuel - FOCUS SUR LA CRÉATIVITÉ
+        template = """# SYSTEM
+Vous êtes un expert en conformité bancaire islamique qui CRÉE des procédures originales.
+
+# MISSION CRITIQUE
+Analysez PROFONDÉMENT la note circulaire fournie et créez une procédure ORIGINALE et SPÉCIFIQUE à son contenu.
+NE COPIEZ JAMAIS les exemples - INSPIREZ-VOUS uniquement des concepts généraux.
+
+# CONTRAINTE ABSOLUE
+- Lisez attentivement CHAQUE détail de la note circulaire
+- Identifiez les exigences SPÉCIFIQUES mentionnées
+- Créez des étapes qui correspondent EXACTEMENT aux besoins de cette note
+- Chaque étape doit traiter un aspect CONCRET de la note circulaire
+
+# CONTEXTE INSPIRANT
+{conceptual_context}
+
+# SORTIE ATTENDUE - FORMAT STRICT
+| N° | Activités | Description | Acteurs | Documents | Applications |
+[EXACTEMENT {min_rows} lignes originales basées sur la note circulaire]
+
+# ANALYSE OBLIGATOIRE DE LA NOTE
+Avant de générer les étapes, identifiez dans la note :
+1. Quel est l'OBJET principal de cette note ?
+2. Quelles sont les EXIGENCES spécifiques ?
+3. Qui sont les ACTEURS concernés ?
+4. Quels DOCUMENTS sont mentionnés ?
+5. Quelles VÉRIFICATIONS sont requises ?
+
+# NOTE CIRCULAIRE À ANALYSER EN DÉTAIL
+{query}
+
+# INSTRUCTIONS DE GÉNÉRATION
+- Chaque étape DOIT correspondre à un élément de la note circulaire
+- Descriptions de 30-70 mots expliquant le POURQUOI et le COMMENT
+- Remplacez "crédit" par "Mourabaha" et "leasing" par "Leasing (Ijara)"
+- Soyez SPÉCIFIQUE aux exigences de cette note, pas générique
+- Format: |N°|Activité spécifique|Description détaillée 30-70 mots|Acteurs concernés|Documents requis|Applications utilisées|
+
+CRÉEZ une procédure UNIQUE pour cette note circulaire spécifique !
+"""
+
+        # Création du prompt et exécution
+        prompt = PromptTemplate(
+            input_variables=['query', 'conceptual_context', 'min_rows'],
+            template=template
+        )
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        
+        try:
+            return chain.run({
+                'query': query_truncated,
+                'conceptual_context': conceptual_context,
+                'min_rows': min_steps
+            })
+        except Exception as e:
+            print(f"Erreur lors de l'exécution avec contexte conceptuel: {e}")
+            # Repli sur génération sans RAG
+            return generate_procedure_without_rag(llm, query_truncated, min_steps, max_steps)
+    
+    else:
+        # Génération sans RAG
+        return generate_procedure_without_rag(llm, query_truncated, min_steps, max_steps)
+
 # --- Génération de la procédure avec exemples ---
 def generate_procedure_with_model(query, model_id="mistral-saba-24b", api_key=None, vectorstore=None, notes_map=None, procedures_map=None, num_steps=None):
     """Génère une procédure à partir d'une note circulaire et d'un modèle spécifique
@@ -289,7 +496,8 @@ def generate_procedure_with_model(query, model_id="mistral-saba-24b", api_key=No
     data = load_data()
     
     print(f"Données chargées: {len(data['docs'])} documents, {len(data['notes_map'])} notes, {len(data['procedures_map'])} procédures")
-      # Initialisation de la base vectorielle pour le RAG
+    
+    # Initialisation de la base vectorielle pour le RAG
     vectorstore = init_vector_store(data["docs"])
     
     if vectorstore is None:
@@ -315,9 +523,8 @@ def generate_procedure_with_model(query, model_id="mistral-saba-24b", api_key=No
                 note_id = doc.metadata.get('numero', 'INCONNU')
                 print(f"  {i}. ID={note_id}, Distance={score:.4f}")
         except Exception as e:
-            print(f"Erreur lors du diagnostic: {e}")        # Recherche de notes similaires
-        similar_notes = find_similar_notes(vectorstore, query)
-        
+            print(f"Erreur lors du diagnostic: {e}")
+    
     print(f"Nombre de notes similaires trouvées: {len(similar_notes)}")
     # Génération de la procédure avec ou sans notes similaires
     return generate_procedure(
@@ -328,161 +535,6 @@ def generate_procedure_with_model(query, model_id="mistral-saba-24b", api_key=No
         procedures_map=data["procedures_map"],
         num_steps=num_steps
     )
-
-# --- Génération principale de la procédure ---
-def generate_procedure(llm, query, similar_notes=None, notes_map=None, procedures_map=None, num_steps=None):
-    """Génère la procédure avec le LLM en utilisant des exemples si disponibles"""
-    # Forcer exactement le nombre d'étapes spécifié ou utiliser la valeur par défaut
-    if num_steps is not None:
-        print(f"Nombre d'étapes demandé par l'utilisateur: {num_steps}")
-        min_steps = num_steps  # Force le minimum au nombre exact
-        max_steps = num_steps  # Force le maximum au nombre exact
-        print(f"Génération avec exactement {num_steps} étapes")
-    else:
-        min_steps = MIN_PROCEDURE_ROWS
-        max_steps = MAX_PROCEDURE_ROWS
-        print("Utilisation du nombre d'étapes par défaut")
-    
-    # Tronquer la requête si elle est trop longue
-    query_truncated = query[:1200] if len(query) > 1200 else query
-    
-    # Debug information
-    print(f"Génération de procédure pour la requête: {query_truncated[:50]}...")
-    print(f"Utilisation du RAG: {'Oui' if similar_notes and len(similar_notes) > 0 else 'Non'}")
-    
-    # Chemin RAG avec notes similaires
-    if similar_notes and len(similar_notes) > 0:
-        print(f"Utilisation de {len(similar_notes)} exemples similaires pour la génération RAG")
-        
-        # Limiter le nombre d'exemples pour économiser des tokens
-        similar_notes = similar_notes[:MAX_EXAMPLES]
-        
-        examples_context = ""
-        for i, note in enumerate(similar_notes, 1):
-            note_id = note['id']
-            procs = procedures_map.get(note_id, []) if procedures_map else []
-            
-            if procs:
-                examples_context += f"\n### EXEMPLE {i} (ID={note_id}) ###\n"
-                examples_context += f"TITRE: {note['titre']}\n"
-                
-                # Tronquer la note circulaire pour économiser des tokens
-                note_text = notes_map.get(note_id, '')[:MAX_NOTE_LENGTH] if notes_map else note['content'][:MAX_NOTE_LENGTH]
-                if len(notes_map.get(note_id, '') if notes_map else note['content']) > MAX_NOTE_LENGTH:
-                    note_text += "... [texte tronqué]"
-                examples_context += f"NOTE CIRCULAIRE (extrait):\n{note_text}\n\n"
-                
-                # Formatage des procédures pour exemples
-                proc_table = extract_procedure_from_dossier_format(procs)
-                examples_context += f"PROCÉDURES DE RÉFÉRENCE:\n{proc_table}\n"
-        
-        # Vérifier si on a réellement des exemples formatés
-        if examples_context.strip():
-            # Template avec exemples
-            template = """# SYSTEM
-Vous êtes un expert en conformité bancaire, familier avec les bonnes pratiques de procédures internes.
-
-# MISSION
-À partir d'une note circulaire fournie, générez EXACTEMENT {min_rows} étapes dans un tableau au format Markdown.
-
-# SORTIE ATTENDUE - FORMAT STRICT
-Commencez OBLIGATOIREMENT par :
-
-| N° | Activités | Description | Acteurs | Documents | Applications |
-[Insérez ici EXACTEMENT {min_rows} lignes]
-
-# CONTRAINTES DE FORMAT
-- Le tableau DOIT commencer immédiatement sans texte avant
-- Chaque ligne DOIT commencer par | et finir par |
-- Le numéro dans la première colonne DOIT être séquentiel (1, 2, 3, etc.)
-- EXACTEMENT {min_rows} lignes sont requises, ni plus ni moins
-
-# CONTEXTE D'EXEMPLES
-{examples_context}
-
-# NOTE À TRAITER
-{query}
-
-# INSTRUCTIONS DÉTAILLÉES
-- Chaque ligne doit être au format : |N°|Activité|Description|Acteurs|Documents|Applications|
-- Remplissez toutes les colonnes, ne laissez aucune cellule vide
-- Utilisez "N/A" si une information n'est pas applicable
-"""
-
-            # Création du prompt et exécution avec la chaîne LangChain
-            prompt = PromptTemplate(
-                input_variables=['query', 'examples_context', 'min_rows', 'max_rows'],
-                template=template
-            )
-            
-            chain = LLMChain(llm=llm, prompt=prompt)
-              # Exécution avec les paramètres
-            try:
-                # Vérifier si examples_context n'est pas vide avant de l'utiliser
-                if examples_context.strip():                    return chain.run({
-                        'query': query_truncated,
-                        'examples_context': examples_context,
-                        'min_rows': min_steps,
-                        'max_rows': max_steps
-                    })
-                else:
-                    print("Contexte d'exemples vide, basculement vers génération sans RAG")
-                    return generate_procedure(llm, query_truncated)
-            except Exception as e:
-                print(f"Erreur lors de l'exécution de la chaîne LangChain avec RAG: {e}")
-                # Repli sur la génération sans RAG
-                return generate_procedure(llm, query_truncated)
-        else:
-            print("Contexte d'exemples vide après traitement, basculement vers génération sans RAG")
-            return generate_procedure(llm, query_truncated, None, None, None)
-    else:
-        # Chemin sans RAG
-        print("Génération sans RAG (pas d'exemples similaires trouvés)")
-        template = """# SYSTEM
-Vous êtes un expert en conformité bancaire.
-
-# MISSION
-Générez EXACTEMENT {min_rows} étapes dans un tableau au format Markdown.
-
-# SORTIE ATTENDUE - FORMAT STRICT
-Commencez OBLIGATOIREMENT par :
-
-| N° | Activités | Description | Acteurs | Documents | Applications |
-[Insérez ici EXACTEMENT {min_rows} lignes]
-
-# CONTRAINTES DE FORMAT
-- Le tableau DOIT commencer immédiatement sans texte avant
-- Chaque ligne DOIT commencer par | et finir par |
-- Le numéro dans la première colonne DOIT être séquentiel (1, 2, 3, etc.)
-- EXACTEMENT {min_rows} lignes sont requises, ni plus ni moins
-
-# NOTE À TRAITER
-{query}
-
-# INSTRUCTIONS DÉTAILLÉES
-- Chaque ligne doit être au format : |N°|Activité|Description|Acteurs|Documents|Applications|
-- Remplissez toutes les colonnes, ne laissez aucune cellule vide
-- Utilisez "N/A" si une information n'est pas applicable
-"""
-
-        # Création du prompt et exécution avec la chaîne LangChain
-        prompt = PromptTemplate(
-            input_variables=['query', 'min_rows', 'max_rows'],
-            template=template
-        )
-        
-        chain = LLMChain(llm=llm, prompt=prompt)
-        
-        # Exécution avec les paramètres
-        try:            return chain.run({
-                'query': query_truncated,
-                'min_rows': min_steps,
-                'max_rows': max_steps
-            })
-        except Exception as e:
-            print(f"Erreur lors de l'exécution de la chaîne LangChain sans RAG: {e}")
-            # Fallback en mode démo
-            return simulate_procedure_generation(query_truncated, "mistral-saba-24b")
 
 # --- Ajout: simulation pour démo ---
 def simulate_procedure_generation(note_circulaire, model_name):
